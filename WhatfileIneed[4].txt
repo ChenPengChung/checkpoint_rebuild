@@ -1,0 +1,7 @@
+1. 呼叫內插資料點生成python code : interp_checkpoint.py 
+2. 讀取初始資料點 (使用者需要自己加入檔案 : 
+   A. "step_12550001" 
+   B. 舊網格資料點 : "adaptive_3.fine grid_I257_J129_g2.0_a0.5(example-old-data).dat" 
+   C. 新網格資料點 : "adaptive_3.fine grid_I513_J257_g3.0_a0.5(example-new-data).dat" 
+3. 生成網格資料點 : 
+   "~restart\checkpoint"
