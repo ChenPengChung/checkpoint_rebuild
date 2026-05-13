@@ -13,6 +13,8 @@ from interp_checkpoint import (
     GridConfig,
     BFR,
     fill_ghost,
+    stitch_y,
+    enforce_periodic_physical_duplicates,
 )
 
 PASS = 0
@@ -219,6 +221,52 @@ check('mass correction restores mean=1.0',
       f'mean_after={mean_after_corr}')
 check('rho_modify is additive correction',
       abs(rho_mod - (1.0 - mean_before_corr)) < 1e-14)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test F: Rank stitch ignores stale checkpoint ghost rows
+# ═══════════════════════════════════════════════════════════════
+print('\n=== Test F: Rank stitch and periodic duplicate handling ===')
+
+cfg_rank = GridConfig(nx=9, ny=9, nz=5, jp=2, gamma=2.0, alpha=0.5,
+                      grid_dat='test.dat')
+per_rank = []
+for r in range(cfg_rank.JP):
+    a = np.full((cfg_rank.NYD6, cfg_rank.NZ6, cfg_rank.NX6),
+                -1000.0 - r, dtype=np.float64)
+    for jl in range(cfg_rank.CHUNK):
+        local_j = BFR + jl
+        global_j = r * cfg_rank.CHUNK + BFR + jl
+        a[local_j, :, :] = global_j
+
+    # Poison rows that should not be authoritative in a stitched global field.
+    a[:BFR, :, :] = 9000.0 + r
+    a[BFR+cfg_rank.CHUNK:, :, :] = 8000.0 + r
+    per_rank.append(a)
+
+stitched = stitch_y(per_rank, cfg_rank)
+unique_rows = stitched[BFR:BFR+cfg_rank.NY-1, BFR, BFR]
+expected_rows = np.arange(BFR, BFR+cfg_rank.NY-1, dtype=np.float64)
+physical = stitched[BFR:BFR+cfg_rank.NY, BFR:BFR+cfg_rank.NZ, BFR:BFR+cfg_rank.NX]
+
+check('stitch_y copies only unique physical rows',
+      np.array_equal(unique_rows, expected_rows),
+      f'rows={unique_rows}')
+check('stitch_y reconstructs j periodic duplicate',
+      np.array_equal(stitched[BFR+cfg_rank.NY-1, :, :], stitched[BFR, :, :]))
+check('stitch_y does not import stale rank ghost rows',
+      not np.any(physical >= 8000.0))
+
+dup = np.zeros((cfg_rank.NY6, cfg_rank.NZ6, cfg_rank.NX6), dtype=np.float64)
+dup[BFR, :, :] = 1.0
+dup[BFR+cfg_rank.NY-1, :, :] = 2.0
+dup[:, :, BFR] += 3.0
+dup[:, :, BFR+cfg_rank.NX-1] += 4.0
+enforce_periodic_physical_duplicates(dup, cfg_rank)
+check('enforce_periodic_physical_duplicates syncs j duplicate',
+      np.array_equal(dup[BFR+cfg_rank.NY-1, :, :], dup[BFR, :, :]))
+check('enforce_periodic_physical_duplicates syncs i duplicate',
+      np.array_equal(dup[:, :, BFR+cfg_rank.NX-1], dup[:, :, BFR]))
 
 
 # ═══════════════════════════════════════════════════════════════

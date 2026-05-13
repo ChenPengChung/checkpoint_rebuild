@@ -780,14 +780,23 @@ def read_rank_bin(path, cfg):
 def stitch_y(per_rank_list, cfg):
     """Combine per-rank arrays into global (NY6, NZ6, NX6).
 
-    Mapping (initialization.h:292):  j_global = rank * (NYD6 - 7) + j_local
-    Overlapping ghost regions across ranks are identical post-MPI-halo;
-    later ranks overwrite earlier ones harmlessly.
+    Only each rank's unique physical rows are authoritative.  Checkpoint
+    files also contain j-ghost rows and one overlap row, but those can be
+    stale for post-collision f buffers.  Copying the whole slab lets a later
+    rank's ghost rows overwrite the previous rank's interior rows, creating
+    visible GPU-seam artifacts after interpolation.
+
+    Unique mapping:
+      local j = 3 .. 3+CHUNK-1  ->  global j = rank*CHUNK+3 .. +CHUNK-1
+
+    The final physical j row is the periodic duplicate of the first physical
+    row and is reconstructed explicitly.
     """
     g = np.zeros((cfg.NY6, cfg.NZ6, cfg.NX6), dtype=np.float64)
     for r in range(cfg.JP):
         j0 = r * cfg.CHUNK
-        g[j0:j0 + cfg.NYD6, :, :] = per_rank_list[r]
+        g[j0+BFR:j0+BFR+cfg.CHUNK, :, :] = per_rank_list[r][BFR:BFR+cfg.CHUNK, :, :]
+    enforce_periodic_physical_duplicates(g, cfg)
     return g
 
 
@@ -798,6 +807,21 @@ def split_y(global_arr, cfg):
         j0 = r * cfg.CHUNK
         out.append(global_arr[j0:j0 + cfg.NYD6, :, :].copy())
     return out
+
+
+def enforce_periodic_physical_duplicates(field, cfg):
+    """Make physical periodic duplicate nodes bitwise identical.
+
+    The solver's mass sum excludes the last physical node in periodic i/j, but
+    the checkpoint and VTK surfaces still contain those duplicate nodes.  Keep
+    them synchronized before ghost fill and rank splitting.
+    """
+    j0 = BFR
+    jL = BFR + cfg.NY - 1
+    i0 = BFR
+    iL = BFR + cfg.NX - 1
+    field[jL, :, :] = field[j0, :, :]
+    field[:, :, iL] = field[:, :, i0]
 
 
 # ---------------------------------------------------------------
@@ -951,7 +975,7 @@ def bilinear_inverse_newton(y_n, z_n, y_corners, z_corners,
     raise _DegenerateCellError()
 
 
-def bilinear_inverse_triangle_fallback(y_n, z_n, y_corners, z_corners, eps=1e-9):
+def bilinear_inverse_triangle_fallback(y_n, z_n, y_corners, z_corners, eps=1e-6):
     """Triangle barycentric fallback when Newton fails or converges out-of-bounds.
 
     Splits cell (a, b, c, d) into 2 triangles:
@@ -986,7 +1010,7 @@ def bilinear_inverse_triangle_fallback(y_n, z_n, y_corners, z_corners, eps=1e-9)
     raise _DegenerateCellError()
 
 
-def find_containing_cell_2d(y_n, z_n, y_old, z_old, bboxes, eps=1e-9):
+def find_containing_cell_2d(y_n, z_n, y_old, z_old, bboxes, eps=1e-6):
     """Locate OLD cell containing (y_n, z_n). Returns (j*, k*, xi, eta).
 
     Per-candidate strategy:
@@ -1070,14 +1094,25 @@ def precompute_phys_mapping_2d(y2d_old, z2d_old, y2d_new, z2d_new,
     z_int_old = z2d_old[BFR:BFR+cfg_old.NY, BFR:BFR+cfg_old.NZ]
     bboxes = build_old_cell_search_index(y_int_old, z_int_old)
 
+    # Domain bounds for clamping: different .dat files may have FP noise at
+    # shared boundaries (e.g., y=-3.4e-8 vs y=0.0).  Clamp NEW coords into
+    # OLD domain so the bbox prefilter doesn't reject boundary points.
+    y_old_min, y_old_max = float(y_int_old.min()), float(y_int_old.max())
+    z_old_min, z_old_max = float(z_int_old.min()), float(z_int_old.max())
+
     jstar = np.empty((cfg_new.NY, cfg_new.NZ), dtype=np.int32)
     kstar = np.empty((cfg_new.NY, cfg_new.NZ), dtype=np.int32)
     xistar = np.empty((cfg_new.NY, cfg_new.NZ), dtype=np.float64)
     etastar = np.empty((cfg_new.NY, cfg_new.NZ), dtype=np.float64)
+    n_clamped = 0
     for j_n in range(cfg_new.NY):
         for k_n in range(cfg_new.NZ):
             y_n = y2d_new[BFR + j_n, BFR + k_n]
             z_n = z2d_new[BFR + j_n, BFR + k_n]
+            if y_n < y_old_min or y_n > y_old_max or z_n < z_old_min or z_n > z_old_max:
+                y_n = max(y_old_min, min(y_old_max, y_n))
+                z_n = max(z_old_min, min(z_old_max, z_n))
+                n_clamped += 1
             j_o, k_o, xi, eta = find_containing_cell_2d(
                 y_n, z_n, y_int_old, z_int_old, bboxes)
             jstar[j_n, k_n] = j_o
@@ -1092,6 +1127,9 @@ def precompute_phys_mapping_2d(y2d_old, z2d_old, y2d_new, z2d_new,
     i_o_arr = np.floor(i_o_float_arr).astype(np.int64)
     xi_i_arr = i_o_float_arr - i_o_arr
 
+    if n_clamped > 0:
+        print('      domain-boundary clamp applied to {} of {} points (FP noise at shared boundary)'.format(
+            n_clamped, cfg_new.NY * cfg_new.NZ))
     print('      Phys mapping cache built: {} cells located'.format(
         cfg_new.NY * cfg_new.NZ))
     return PhysMapping2D(jstar, kstar, xistar, etastar, i_o_arr, xi_i_arr,
@@ -2127,7 +2165,9 @@ def main():
         uz_new = interpolate_comp_3d(uz_g, OLD, NEW)
         print('      uz:   {:.1f}s'.format(time.time() - t))
 
-    print('      Filling ghost cells')
+    print('      Enforcing periodic duplicate nodes and filling ghost cells')
+    for arr in (rho_new, ux_new, uy_new, uz_new):
+        enforce_periodic_physical_duplicates(arr, NEW)
     fill_ghost(rho_new, NEW)
     fill_ghost(ux_new, NEW)
     fill_ghost(uy_new, NEW)
@@ -2264,6 +2304,7 @@ def main():
 
             f_new = feq_full.copy()
             f_new[BFR:BFR+NEW.NY, BFR:BFR+NEW.NZ, BFR:BFR+NEW.NX] += fneq_int
+            enforce_periodic_physical_duplicates(f_new, NEW)
             fill_ghost(f_new, NEW)
             del feq_full
 
@@ -2309,6 +2350,8 @@ def main():
             feq = compute_feq_q(rho_new, ux_new, uy_new, uz_new, q)
             f_new = feq + args.fneq_scale * fneq_new
             del feq, fneq_new
+            enforce_periodic_physical_duplicates(f_new, NEW)
+            fill_ghost(f_new, NEW)
 
             rho_check += f_new
             if np.any(np.isnan(f_new)) or np.any(np.isinf(f_new)):
