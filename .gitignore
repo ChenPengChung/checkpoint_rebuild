@@ -30,6 +30,11 @@ restart/
 
 # Grid data files (large, should be generated or obtained separately)
 J_Frohlich/*.dat
+phase1_generategrid/*.dat
+
+# Adaptive grid data files
+adaptive*.dat
+**/adaptive*.dat
 
 # Temporary / in-progress writes
 *.WRITING/

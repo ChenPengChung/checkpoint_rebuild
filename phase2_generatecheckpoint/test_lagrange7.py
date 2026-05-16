@@ -3,18 +3,27 @@
 
 import sys
 import os
+import tempfile
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from interp_checkpoint import (
     lagrange7_weights,
     lagrange7_weights_vectorized,
+    clamp_wall_macros,
     apply_rho_mass_correction,
+    apply_Ub_correction,
+    chapman_enskog_fneq_q,
+    compute_Ub,
     GridConfig,
     BFR,
+    E,
     fill_ghost,
     stitch_y,
     enforce_periodic_physical_duplicates,
+    compare_grid_dat_coords,
+    derive_solver_grid_dat,
+    validate_solver_grid_match,
 )
 
 PASS = 0
@@ -90,32 +99,38 @@ check('polynomial p=7 NOT exact (expected)', max(errs) > 1e-3,
       f'max_err={max(errs):.2e}')
 
 # ═══════════════════════════════════════════════════════════════
-# Test C: Mass correction matching solver
+# Test C: Wall-preserving full-domain mass correction
 # ═══════════════════════════════════════════════════════════════
-print('\n=== Test C: Mass correction (ReduceRhoSum_Kernel) ===')
+print('\n=== Test C: Wall-preserving full-domain mass correction ===')
 
 # Create a small test grid
 cfg = GridConfig(nx=9, ny=9, nz=9, jp=1, gamma=2.0, alpha=0.5,
                  grid_dat='test.dat')
 rho = np.ones((cfg.NY6, cfg.NZ6, cfg.NX6), dtype=np.float64)
-# Perturb interior
-rho[BFR:BFR+2, BFR:BFR+2, BFR:BFR+2] = 1.05  # heavier patch
+# Perturb non-wall interior
+rho[BFR:BFR+2, BFR+1:BFR+3, BFR:BFR+2] = 1.05  # heavier patch
 
 ni = cfg.NX6 - 7
 nj = cfg.NY6 - 7
 nk = cfg.NZ6 - 6
-N_interior = ni * nj * nk
-rho_sum_before = np.sum(rho[BFR:BFR+nj, BFR:BFR+nk, BFR:BFR+ni])
-mean_before = rho_sum_before / N_interior
+N_full = ni * nj * nk
+N_adjust = ni * nj * (nk - 2)
+full_sl = (slice(BFR, BFR+nj), slice(BFR, BFR+nk), slice(BFR, BFR+ni))
+rho_sum_before = np.sum(rho[full_sl])
+mean_before = rho_sum_before / N_full
 
 rho_modify, mean_b, mean_a = apply_rho_mass_correction(rho, cfg)
 
-rho_sum_after = np.sum(rho[BFR:BFR+nj, BFR:BFR+nk, BFR:BFR+ni])
+rho_sum_after = np.sum(rho[full_sl])
 check('mean rho == 1.0 after correction',
-      abs(rho_sum_after / N_interior - 1.0) < 1e-14,
-      f'mean={rho_sum_after / N_interior}')
-check('rho_modify formula matches solver',
-      abs(rho_modify - (N_interior * 1.0 - rho_sum_before) / N_interior) < 1e-14)
+      abs(rho_sum_after / N_full - 1.0) < 1e-14,
+      f'mean={rho_sum_after / N_full}')
+check('rho_modify uses non-wall rows only',
+      abs(rho_modify - (N_full * 1.0 - rho_sum_before) / N_adjust) < 1e-14)
+check('bottom wall rho remains exactly 1',
+      np.all(rho[BFR:BFR+nj, BFR, BFR:BFR+ni] == 1.0))
+check('top wall rho remains exactly 1',
+      np.all(rho[BFR:BFR+nj, BFR+nk-1, BFR:BFR+ni] == 1.0))
 
 # Verify interior range matches solver ReduceRhoSum_Kernel:
 #   i (periodic): ni = NX6-7 = NX-1  →  [3, NX6-4)  excludes periodic duplicate
@@ -124,6 +139,7 @@ check('rho_modify formula matches solver',
 check('ni = NX6-7 = NX-1 (periodic: excludes duplicate)', ni == cfg.NX - 1)
 check('nj = NY6-7 = NY-1 (periodic: excludes duplicate)', nj == cfg.NY - 1)
 check('nk = NZ6-6 = NZ   (wall: includes both walls)',    nk == cfg.NZ)
+check('N_adjust excludes both wall rows', N_adjust == ni * nj * (cfg.NZ - 2))
 
 # Closed-interval last index = N6-4 for all directions (3 ghost each side)
 # But half-open upper bound differs: periodic [3, N6-4), wall [3, N6-3)
@@ -200,33 +216,162 @@ check('same-grid bilinear identity (max err)',
 
 
 # ═══════════════════════════════════════════════════════════════
-# Test E: Verify mass correction integrates with Lagrange output
+# Test E: Boundary Lagrange interpolation uses cubic ghost extrapolation
 # ═══════════════════════════════════════════════════════════════
-print('\n=== Test E: Mass correction on interpolated field ===')
+print('\n=== Test E: Boundary Lagrange interpolation ===')
+
+cfg_old_refine = GridConfig(nx=9, ny=9, nz=9, jp=1, gamma=2.0, alpha=0.5,
+                            grid_dat='')
+cfg_new_refine = GridConfig(nx=17, ny=17, nz=17, jp=1, gamma=2.0, alpha=0.5,
+                            grid_dat='')
+
+def build_uniform_grid(cfg_local):
+    y1 = np.linspace(0, LY, cfg_local.NY)
+    z1 = np.linspace(0, LZ, cfg_local.NZ)
+    y = np.zeros((cfg_local.NY6, cfg_local.NZ6))
+    z = np.zeros((cfg_local.NY6, cfg_local.NZ6))
+    y[BFR:BFR+cfg_local.NY, BFR:BFR+cfg_local.NZ] = y1[:, np.newaxis]
+    z[BFR:BFR+cfg_local.NY, BFR:BFR+cfg_local.NZ] = z1[np.newaxis, :]
+    for g in range(BFR):
+        y[g, :] = y[BFR, :] - (BFR - g) * (y1[1] - y1[0])
+        y[cfg_local.NY6-1-g, :] = y[cfg_local.NY6-1-BFR, :] + (BFR - g) * (y1[1] - y1[0])
+        z[:, g] = z[:, BFR]
+        z[:, cfg_local.NZ6-1-g] = z[:, cfg_local.NZ6-1-BFR]
+    return y, z
+
+y_old_ref, z_old_ref = build_uniform_grid(cfg_old_refine)
+y_new_ref, z_new_ref = build_uniform_grid(cfg_new_refine)
+field_linear_z = np.zeros((cfg_old_refine.NY6, cfg_old_refine.NZ6, cfg_old_refine.NX6))
+for j in range(cfg_old_refine.NY):
+    for k in range(cfg_old_refine.NZ):
+        field_linear_z[BFR+j, BFR+k, BFR:BFR+cfg_old_refine.NX] = z_old_ref[BFR+j, BFR+k]
+fill_ghost(field_linear_z, cfg_old_refine)
+mapping_refine = precompute_phys_mapping_2d(
+    y_old_ref, z_old_ref, y_new_ref, z_new_ref, cfg_old_refine, cfg_new_refine)
+field_linear_z_refined = interpolate_lagrange7_3d_with_mapping(field_linear_z, mapping_refine)
+expected_z = z_new_ref[BFR:BFR+cfg_new_refine.NY, BFR:BFR+cfg_new_refine.NZ]
+lag_line = field_linear_z_refined[BFR, BFR:BFR+cfg_new_refine.NZ, BFR]
+check('refined-grid Lagrange-7 preserves linear z at wall band',
+      np.max(np.abs(lag_line - expected_z[0])) < 1e-12,
+      f'max_err={np.max(np.abs(lag_line - expected_z[0])):.2e}')
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test F: Verify macro wall policy and mass correction integration
+# ═══════════════════════════════════════════════════════════════
+print('\n=== Test F: Macro wall policy and mass correction ===')
 
 # After Lagrange interpolation, perturb rho and verify correction
 rho_test = field_lag7.copy()
 rho_test[BFR:BFR+NY, BFR:BFR+NZ, BFR:BFR+NX] *= 1.001  # slight perturbation
+ux_test = np.ones_like(rho_test)
+uy_test = np.ones_like(rho_test)
+uz_test = np.ones_like(rho_test)
+
+wall_u_before, wall_rho_before = clamp_wall_macros(
+    rho_test, ux_test, uy_test, uz_test, cfg_small)
+kt_small = cfg_small.NZ6 - 1 - BFR
+check('wall clamp sees non-zero velocity residual', wall_u_before > 0.0)
+check('wall clamp sees rho residual', wall_rho_before > 0.0)
+check('wall clamp sets bottom velocity to zero',
+      np.all(ux_test[:, BFR, :] == 0.0) and np.all(uy_test[:, BFR, :] == 0.0)
+      and np.all(uz_test[:, BFR, :] == 0.0))
+check('wall clamp sets top velocity to zero',
+      np.all(ux_test[:, kt_small, :] == 0.0) and np.all(uy_test[:, kt_small, :] == 0.0)
+      and np.all(uz_test[:, kt_small, :] == 0.0))
+check('wall clamp sets rho to one',
+      np.all(rho_test[:, BFR, :] == 1.0) and np.all(rho_test[:, kt_small, :] == 1.0))
 
 ni = NX6 - 7; nj = NY6 - 7; nk = NZ6 - 6
-N_int = ni * nj * nk
-int_sl = (slice(BFR, BFR+nj), slice(BFR, BFR+nk), slice(BFR, BFR+ni))
-mean_before_corr = np.sum(rho_test[int_sl]) / N_int
+N_full = ni * nj * nk
+N_adjust = ni * nj * (nk - 2)
+full_sl = (slice(BFR, BFR+nj), slice(BFR, BFR+nk), slice(BFR, BFR+ni))
+mean_before_corr = np.sum(rho_test[full_sl]) / N_full
 
 rho_mod, mb, ma = apply_rho_mass_correction(rho_test, cfg_small)
-mean_after_corr = np.sum(rho_test[int_sl]) / N_int
+mean_after_corr = np.sum(rho_test[full_sl]) / N_full
 
 check('mass correction restores mean=1.0',
       abs(mean_after_corr - 1.0) < 1e-14,
       f'mean_after={mean_after_corr}')
 check('rho_modify is additive correction',
-      abs(rho_mod - (1.0 - mean_before_corr)) < 1e-14)
+      abs(rho_mod - (1.0 - mean_before_corr) * N_full / N_adjust) < 1e-14)
+check('mass correction preserves wall rho=1',
+      np.all(rho_test[:, BFR, :] == 1.0) and np.all(rho_test[:, kt_small, :] == 1.0))
 
 
 # ═══════════════════════════════════════════════════════════════
-# Test F: Rank stitch ignores stale checkpoint ghost rows
+# Test G: U_bulk correction preserves walls and matches target
 # ═══════════════════════════════════════════════════════════════
-print('\n=== Test F: Rank stitch and periodic duplicate handling ===')
+print('\n=== Test G: U_bulk correction ===')
+
+uy_bulk = np.zeros_like(field_lag7)
+uy_bulk[BFR:BFR+NY, BFR+1:BFR+NZ-1, BFR:BFR+NX] = 0.25
+enforce_periodic_physical_duplicates(uy_bulk, cfg_small)
+fill_ghost(uy_bulk, cfg_small)
+
+Ub_bulk_before = compute_Ub(uy_bulk, z2d, cfg_small)
+Ub_bulk_target = 1.25 * Ub_bulk_before
+scale_bulk, Ub_before, Ub_after = apply_Ub_correction(
+    Ub_bulk_target, uy_bulk, z2d, cfg_small)
+
+check('U_bulk correction scale matches target ratio',
+      abs(scale_bulk - 1.25) < 1e-14,
+      f'scale={scale_bulk}')
+check('U_bulk correction reaches target',
+      abs(Ub_after - Ub_bulk_target) < 1e-14,
+      f'Ub_after={Ub_after}, target={Ub_bulk_target}')
+check('U_bulk correction leaves wall rows clamped',
+      np.all(uy_bulk[:, BFR, :] == 0.0) and np.all(uy_bulk[:, kt_small, :] == 0.0))
+check('U_bulk correction scales non-wall interior nodes',
+      np.allclose(
+          uy_bulk[BFR:BFR+NY, BFR+1:BFR+NZ-1, BFR:BFR+NX],
+          0.25 * scale_bulk))
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test H: CE fneq rebuild includes walls and preserves conserved moments
+# ═══════════════════════════════════════════════════════════════
+print('\n=== Test H: CE fneq full-domain rebuild ===')
+
+rho_int = np.ones((NY, NZ, NX), dtype=np.float64)
+zero = np.zeros_like(rho_int)
+dudx = np.full_like(rho_int, 0.125)
+dvdy = np.full_like(rho_int, -0.05)
+dwdz = np.full_like(rho_int, 0.025)
+grad = (dudx, zero, zero, zero, dvdy, zero, zero, zero, dwdz)
+fneq_stack = np.stack([
+    chapman_enskog_fneq_q(rho_int, grad, q, ce_coeff=-0.2)
+    for q in range(19)
+], axis=0)
+
+mass_mode = np.sum(fneq_stack, axis=0)
+mx_mode = np.tensordot(E[:, 0], fneq_stack, axes=(0, 0))
+my_mode = np.tensordot(E[:, 1], fneq_stack, axes=(0, 0))
+mz_mode = np.tensordot(E[:, 2], fneq_stack, axes=(0, 0))
+
+check('CE fneq is rebuilt on bottom wall row',
+      np.any(np.abs(fneq_stack[:, :, 0, :]) > 0.0))
+check('CE fneq is rebuilt on top wall row',
+      np.any(np.abs(fneq_stack[:, :, -1, :]) > 0.0))
+check('CE fneq preserves zero density moment',
+      np.max(np.abs(mass_mode)) < 1e-14,
+      f'max={np.max(np.abs(mass_mode)):.2e}')
+check('CE fneq preserves zero x-momentum moment',
+      np.max(np.abs(mx_mode)) < 1e-14,
+      f'max={np.max(np.abs(mx_mode)):.2e}')
+check('CE fneq preserves zero y-momentum moment',
+      np.max(np.abs(my_mode)) < 1e-14,
+      f'max={np.max(np.abs(my_mode)):.2e}')
+check('CE fneq preserves zero z-momentum moment',
+      np.max(np.abs(mz_mode)) < 1e-14,
+      f'max={np.max(np.abs(mz_mode)):.2e}')
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test I: Rank stitch ignores stale checkpoint ghost rows
+# ═══════════════════════════════════════════════════════════════
+print('\n=== Test I: Rank stitch and periodic duplicate handling ===')
 
 cfg_rank = GridConfig(nx=9, ny=9, nz=5, jp=2, gamma=2.0, alpha=0.5,
                       grid_dat='test.dat')
@@ -267,6 +412,59 @@ check('enforce_periodic_physical_duplicates syncs j duplicate',
       np.array_equal(dup[BFR+cfg_rank.NY-1, :, :], dup[BFR, :, :]))
 check('enforce_periodic_physical_duplicates syncs i duplicate',
       np.array_equal(dup[:, :, BFR+cfg_rank.NX-1], dup[:, :, BFR]))
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test J: NEW grid must match solver runtime grid
+# ═══════════════════════════════════════════════════════════════
+print('\n=== Test J: Solver grid identity preflight ===')
+
+def write_tiny_grid(path, ni=4, nj=3, delta=0.0):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('TITLE = "tiny"\n')
+        f.write('VARIABLES = "x corner"\n')
+        f.write('"y corner"\n')
+        f.write('ZONE T="tiny"\n')
+        f.write(f' I={ni}, J={nj}, K=1,F=POINT\n')
+        f.write('DT=(SINGLE SINGLE )\n')
+        for j in range(nj):
+            for i in range(ni):
+                f.write(f'{float(i):.17g} {float(j) + delta:.17g}\n')
+
+with tempfile.TemporaryDirectory() as td:
+    a = os.path.join(td, 'newgrid.dat')
+    b = os.path.join(td, 'solver_same.dat')
+    c = os.path.join(td, 'solver_shifted.dat')
+    write_tiny_grid(a)
+    write_tiny_grid(b)
+    write_tiny_grid(c, delta=1e-6)
+    cfg_grid = GridConfig(nx=5, ny=4, nz=3, jp=1, gamma=3.7, alpha=0.5,
+                          grid_dat=a)
+
+    same = compare_grid_dat_coords(a, b, cfg_grid)
+    diff = compare_grid_dat_coords(a, c, cfg_grid)
+    check('grid coordinate compare exact match',
+          same['max_abs'] == 0.0 and same['count'] == 12)
+    check('grid coordinate compare detects mismatch',
+          diff['max_abs_y'] > 0.0 and diff['max_abs'] > 0.0)
+
+    info_ok = validate_solver_grid_match(a, b, cfg_grid, tol=0.0, fatal=False)
+    info_bad = validate_solver_grid_match(a, c, cfg_grid, tol=0.0, fatal=False)
+    check('validate_solver_grid_match reports ok',
+          info_ok is not None and info_ok['ok'])
+    check('validate_solver_grid_match reports mismatch',
+          info_bad is not None and not info_bad['ok'])
+
+    vh = os.path.join(td, 'variables.h')
+    with open(vh, 'w', encoding='utf-8') as f:
+        f.write('#define GRID_DAT_DIR "J_Frohlich"\n')
+        f.write('#define GRID_DAT_REF "3.fine grid.dat"\n')
+    derived = derive_solver_grid_dat(vh, cfg_grid)
+    expected = os.path.join(td, 'J_Frohlich',
+                            'adaptive_3.fine grid_I4_J3_g3.70_a0.5.dat')
+    check('derive_solver_grid_dat mirrors main.cu naming',
+          derived == os.path.abspath(expected),
+          f'derived={derived}')
 
 
 # ═══════════════════════════════════════════════════════════════
