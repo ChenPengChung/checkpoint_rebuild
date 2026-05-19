@@ -131,8 +131,8 @@ Step 4: 建立 NEW grid 座標
         讀取 NEW Tecplot .dat → 同上
 
 Step 5: 計算空間插值
-        在 computational space (j, k, i) 做 3D 插值
-        OLD (j,k,i) → NEW (j,k,i)
+        預設在 physical space 以 cell search + Lagrange-7 做 3D 插值
+        NEW 物理座標 → OLD cell → 取得 (xi, eta) → 插值
         注意: GAMMA 不同時, 同一個 (j,k,i) 對應不同物理高度 z
 
 Step 6: 填充 ghost cells

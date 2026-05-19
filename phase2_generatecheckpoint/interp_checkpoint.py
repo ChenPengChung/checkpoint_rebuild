@@ -25,17 +25,26 @@ Pipeline:
                 Near-wall stencils use cubic ghost extrapolation (solver-matched).
              --interp-order 2:          bilinear O(h^2) (legacy).
            comp:           legacy computational (j, k, i) remap for A/B tests.
-     5b. Clamp wall macros: u=v=w=0, rho=1 at k=3 and k=NZ6-4 (no-slip).
-     5c. Global density correction: additive offset on non-wall interior rows
-         so full-domain mean rho returns to 1 while walls stay at rho=1.
+     5b. Clamp wall velocity only: u=v=w=0 at k=3 and k=NZ6-4 (no-slip).
+         Preserve wall rho so restart pressure stays consistent with the
+         interpolated source field and with the runtime solver policy.
+     5c. Global density correction: uniform additive offset on the full
+         physical domain, matching the runtime mass-correction kernel.
      5d. Bulk velocity correction: scale interior streamwise velocity so
          Ub(NEW) = Ub(OLD); wall rows excluded from scaling (remain u=0).
+     5e. Velocity projection (--project-velocity poisson, default):
+         poisson:   approximate Helmholtz-Hodge correction.
+         dg-exact:  direct solve of the exact CD2 D*G scalar projection.
+         div-exact: direct minimum-norm velocity correction that zeroes the
+                    final CD2 divergence diagnostic to roundoff.  Wall
+                    velocity is constrained inside the projection, and no
+                    later step modifies the interior velocity before f_eq.
   6. Reconstruct f_q for q = 0..18 from the corrected macroscopic quantities
-     (rho, u, v, w) produced by steps 5a-5d. Both f_eq AND f_neq are
-     computed from these corrected fields on the full domain including
-     walls, then combined: f_q = f_eq + f_neq.  Mode --fneq-mode selects
-     how f_neq is obtained:
-       chapman-enskog (default): f_eq and f_neq both built from corrected
+     (rho, u, v, w) produced by steps 5a-5e. Mode --fneq-mode selects how the
+     non-equilibrium component is handled:
+       zero (default):           stability A/B test mode; write pure
+                                 equilibrium f_q = f_eq, i.e. f_neq = 0.
+       chapman-enskog:           f_eq and f_neq both built from corrected
                                  macros. f_neq reconstructed from NEW-grid
                                  velocity gradients via Chapman-Enskog.
                                  Wall rows use the solver-matched one-sided FD
@@ -69,8 +78,8 @@ Usage:
       --old-gamma 2.0 --old-grid-dat old_grid.dat \\
       --new-nx 257 --new-ny 513 --new-nz 257 --new-jp 16 \\
       --new-gamma 3.0 --new-alpha 0.5 --new-grid-dat new_grid.dat \\
-      --output-root restart/checkpoint --step 1 \
-      --interp-mode phys --fneq-mode chapman-enskog
+      --output-root restart/checkpoint --step 1 \\
+      --interp-mode phys --fneq-mode zero
 
 Expected folder structure:
   workspace/
@@ -1196,7 +1205,7 @@ def bilinear_inverse_newton(y_n, z_n, y_corners, z_corners,
     raise _DegenerateCellError()
 
 
-def bilinear_inverse_triangle_fallback(y_n, z_n, y_corners, z_corners, eps=1e-5):
+def bilinear_inverse_triangle_fallback(y_n, z_n, y_corners, z_corners, eps=5e-5):
     """Triangle barycentric fallback when Newton fails or converges out-of-bounds.
 
     Splits cell (a, b, c, d) into 2 triangles:
@@ -1232,7 +1241,7 @@ def bilinear_inverse_triangle_fallback(y_n, z_n, y_corners, z_corners, eps=1e-5)
 
 
 def find_containing_cell_2d(y_n, z_n, y_old, z_old, bboxes,
-                            eps_phys=1e-7, eps_param=1e-5):
+                            eps_phys=5e-6, eps_param=5e-5):
     """Locate OLD cell containing (y_n, z_n). Returns (j*, k*, xi, eta).
 
     eps_phys  — physical-space tolerance for bbox pre-filter
@@ -1607,7 +1616,7 @@ def interpolate_lagrange7_3d_with_mapping(field_old, mapping):
 
 
 def clamp_wall_macros(rho, ux, uy, uz, cfg):
-    """Clamp physical wall macros before global conservation corrections."""
+    """Clamp physical wall velocity before global conservation corrections."""
     kt = cfg.NZ6 - 1 - BFR
     wall_u_max_before = max(
         float(np.max(np.abs(ux[:, BFR, :]))), float(np.max(np.abs(ux[:, kt, :]))),
@@ -1619,8 +1628,6 @@ def clamp_wall_macros(rho, ux, uy, uz, cfg):
         float(np.max(np.abs(rho[:, kt, :] - 1.0))),
     )
 
-    rho[:, BFR, :] = 1.0
-    rho[:, kt, :] = 1.0
     for arr in (ux, uy, uz):
         arr[:, BFR, :] = 0.0
         arr[:, kt, :] = 0.0
@@ -1629,39 +1636,31 @@ def clamp_wall_macros(rho, ux, uy, uz, cfg):
 
 
 def apply_rho_mass_correction(rho, cfg):
-    """Restore full-domain mean rho=1 while keeping physical wall rho=1.
+    """Restore full-domain mean rho=1 with the same uniform offset as runtime.
 
     The conserved domain matches the solver reduction domain:
       i∈[3, NX6-4), j∈[3, NY6-4), k∈[3, NZ6-3)
     including both physical wall rows and excluding periodic duplicates.
 
-    Because checkpoint rebuilds clamp wall density to exactly 1 before this
-    correction, only non-wall rows absorb the additive offset:
-      k∈[4, NZ6-4)
-    This preserves wall mass exactly while restoring the full-domain total.
+    The runtime GILBM kernel applies rho_modify to every physical k row,
+    including both walls.  Rebuild checkpoints must use the same policy;
+    otherwise the restart state introduces an artificial wall-pressure reset.
     """
     ni = cfg.NX6 - 7
     nj = cfg.NY6 - 7
     nk = cfg.NZ6 - 6
     N_full = ni * nj * nk
-    N_adjust = ni * nj * max(nk - 2, 0)
-    if N_adjust <= 0:
-        raise ValueError('apply_rho_mass_correction requires at least one non-wall k row')
 
     full_domain = (slice(BFR, BFR + nj),
                    slice(BFR, BFR + nk),
                    slice(BFR, BFR + ni))
-    adjust_domain = (slice(BFR, BFR + nj),
-                     slice(BFR + 1, BFR + nk - 1),
-                     slice(BFR, BFR + ni))
 
     rho_sum = float(np.sum(rho[full_domain]))
     rho_global_avg = rho_sum / float(N_full)
-    rho_avg_defect = 1.0 - rho_global_avg
-    rho_modify = rho_avg_defect * float(N_full) / float(N_adjust)
+    rho_modify = 1.0 - rho_global_avg
 
     mean_before = rho_global_avg
-    rho[adjust_domain] += rho_modify
+    rho[full_domain] += rho_modify
     mean_after = float(np.sum(rho[full_domain])) / float(N_full)
 
     return rho_modify, mean_before, mean_after
@@ -2159,10 +2158,27 @@ def main():
                    help='advanced override for output checkpoint directory; default is output-root/step_%%08d')
     p.add_argument('--fneq-scale', type=float, default=1.0,
                    help='scale factor applied to interpolated f_neq (legacy mode only; default: %(default)s)')
-    p.add_argument('--fneq-mode', choices=['interp', 'chapman-enskog'], default='chapman-enskog',
-                   help='f_neq reconstruction strategy. "interp" = legacy linear interp of f_neq '
-                        '(loses gradient info; default before fix). "chapman-enskog" = rebuild f_neq '
-                        'on NEW grid from velocity gradients via CE expansion (recommended; default).')
+    p.add_argument('--fneq-mode', choices=['zero', 'interp', 'chapman-enskog'], default='chapman-enskog',
+                   help='f_neq reconstruction strategy. '
+                        '"chapman-enskog" = rebuild f_neq on NEW grid from velocity '
+                        'gradients via CE expansion (default). '
+                        '"zero" = pure equilibrium f=f_eq for stability A/B testing. '
+                        '"interp" = legacy linear interp of f_neq (loses gradient info).')
+    p.add_argument('--project-velocity', choices=['poisson', 'dg-exact', 'div-exact', 'none'],
+                   default='poisson',
+                   help='Velocity projection after interpolation. "poisson" = Helmholtz-Hodge '
+                        'div(grad(phi))=div(u) to enforce solenoidal constraint (default). '
+                        '"dg-exact" = direct solve of the exact CD2 D*G operator '
+                        'used by the final divergence check. '
+                        '"div-exact" = exact minimum-norm velocity correction '
+                        'that directly zeroes the final CD2 divergence diagnostic. '
+                        '"none" = skip projection (legacy/debug).')
+    p.add_argument('--projection-max-outer', type=int, default=80,
+                   help='maximum outer Richardson iterations for Poisson projection '
+                        '(default: %(default)s; one-time preprocessing cost)')
+    p.add_argument('--projection-div-tol', type=float, default=1e-6,
+                   help='target RMS divergence tolerance for Poisson projection '
+                        '(default: %(default)s)')
     p.add_argument('--interp-mode', choices=['comp', 'phys'], default='phys',
                    help='Macro field (rho, u) interpolation mode. "phys" = physical-space '
                         'with 2D cell search + bilinear inverse (default; correct for GAMMA changes). '
@@ -2595,14 +2611,14 @@ def main():
         uz_new = interpolate_comp_3d(uz_g, OLD, NEW)
         print('      uz:   {:.1f}s'.format(time.time() - t))
 
-    print('      Applying wall macro constraints: u=v=w=0, rho=1')
+    print('      Applying wall velocity constraint: u=v=w=0 (preserve rho)')
     wall_residual_max, wall_rho_delta_max = clamp_wall_macros(
         rho_new, ux_new, uy_new, uz_new, NEW)
     print('      max |u_wall| before clamp = {:.3e}'.format(wall_residual_max))
-    print('      max |rho_wall - 1| before clamp = {:.3e}'.format(wall_rho_delta_max))
+    print('      max |rho_wall - 1| preserved = {:.3e}'.format(wall_rho_delta_max))
 
     rho_modify, mean_before, mean_after = apply_rho_mass_correction(rho_new, NEW)
-    print('      rho mass correction (non-wall rows): rho_modify = {:.6e}'.format(rho_modify))
+    print('      rho mass correction (full domain): rho_modify = {:.6e}'.format(rho_modify))
     print('      rho full-domain mean: {:.15f} -> {:.15f}'.format(mean_before, mean_after))
 
     print('      Enforcing periodic duplicate nodes and filling ghost cells')
@@ -2613,10 +2629,6 @@ def main():
     fill_ghost(uy_new, NEW)
     fill_ghost(uz_new, NEW)
 
-    # Ub conservation correction: scale streamwise velocity to match OLD Ub
-    ub_scale, Ub_new_before, Ub_new_after = apply_Ub_correction(
-        Ub_old, uy_new, z2d_new, NEW)
-
     new_int = (slice(BFR, BFR+NEW.NY), slice(BFR, BFR+NEW.NZ), slice(BFR, BFR+NEW.NX))
     print('      NEW interior rho = [{:.6f}, {:.6f}], mean = {:.6f}'.format(
         rho_new[new_int].min(), rho_new[new_int].max(), rho_new[new_int].mean()))
@@ -2624,6 +2636,73 @@ def main():
         np.abs(ux_new[new_int]).max(),
         np.abs(uy_new[new_int]).max(),
         np.abs(uz_new[new_int]).max()))
+
+    # Initialization correction order:
+    #   wall-clamp -> rho-correct -> ghost-fill -> Ub-scale -> ghost-refill
+    #   -> Poisson-with-wall-constraint -> final ghost-refill -> div-check -> f_eq
+    # Poisson is the final operation that modifies the interior velocity.  This
+    # prevents wall re-clamping or one-component Ub scaling from reintroducing
+    # divergence after the solenoidal projection.
+
+    # Ub conservation correction: scale streamwise velocity to match OLD Ub.
+    # This is intentionally before the projection because uy-only scaling is
+    # not a divergence-free operation on the curvilinear grid.
+    ub_scale, Ub_new_before, Ub_new_after = apply_Ub_correction(
+        Ub_old, uy_new, z2d_new, NEW)
+
+    print('      Periodic duplicate enforcement and ghost-cell fill before projection')
+    for arr in (rho_new, ux_new, uy_new, uz_new):
+        enforce_periodic_physical_duplicates(arr, NEW)
+    fill_ghost(rho_new, NEW)
+    fill_ghost(ux_new, NEW)
+    fill_ghost(uy_new, NEW)
+    fill_ghost(uz_new, NEW)
+
+    # ---- Poisson velocity projection (solenoidal correction) ----
+    proj_info = None
+    divergence_diagnostic_fn = None
+    if args.project_velocity in ('poisson', 'dg-exact', 'div-exact'):
+        print('      --- Velocity projection ---')
+        from poisson_projection import (
+            poisson_project, poisson_project_dg_exact,
+            velocity_project_div_exact,
+            PoissonProjectionError, divergence_diagnostic)
+        divergence_diagnostic_fn = divergence_diagnostic
+        try:
+            if args.project_velocity == 'dg-exact':
+                ux_new, uy_new, uz_new, proj_info = poisson_project_dg_exact(
+                    ux_new, uy_new, uz_new, NEW, y2d_new, z2d_new,
+                    max_outer=args.projection_max_outer,
+                    div_tol=args.projection_div_tol)
+            elif args.project_velocity == 'div-exact':
+                ux_new, uy_new, uz_new, proj_info = velocity_project_div_exact(
+                    ux_new, uy_new, uz_new, NEW, y2d_new, z2d_new,
+                    max_outer=args.projection_max_outer,
+                    div_tol=args.projection_div_tol)
+            else:
+                ux_new, uy_new, uz_new, proj_info = poisson_project(
+                    ux_new, uy_new, uz_new, NEW, y2d_new, z2d_new,
+                    max_outer=args.projection_max_outer,
+                    div_tol=args.projection_div_tol)
+        except PoissonProjectionError as e:
+            sys.exit('FATAL: Poisson projection failed: {}\n'
+                     '  Velocity field was NOT modified.\n'
+                     '  Cannot produce a solenoidal checkpoint — aborting.'.format(e))
+        print('      wall velocity constrained inside projection')
+    else:
+        print('      velocity projection: SKIPPED (--project-velocity none)')
+
+    print('      Final periodic duplicate enforcement and ghost-cell fill')
+    for arr in (rho_new, ux_new, uy_new, uz_new):
+        enforce_periodic_physical_duplicates(arr, NEW)
+    fill_ghost(rho_new, NEW)
+    fill_ghost(ux_new, NEW)
+    fill_ghost(uy_new, NEW)
+    fill_ghost(uz_new, NEW)
+
+    Ub_final = compute_Ub(uy_new, z2d_new, NEW)
+    print('      Final Ub before f_eq = {:.15e} (target {:.15e}, residual {:.3e})'.format(
+        Ub_final, Ub_old, abs(Ub_final - Ub_old)))
 
     # ---- Step 6: NEW-grid dt_global for CE coefficient and metadata ----
     print('[6/8] Computing NEW-grid dt_global')
@@ -2643,6 +2722,39 @@ def main():
     else:
         dt_for_meta = '{:.15e}'.format(dt_real)
 
+    final_div_rms = None
+    final_div_max = None
+    if divergence_diagnostic_fn is None:
+        try:
+            from poisson_projection import divergence_diagnostic as divergence_diagnostic_fn
+        except Exception:
+            divergence_diagnostic_fn = None
+    if divergence_diagnostic_fn is not None:
+        div_rms, div_max = divergence_diagnostic_fn(
+            ux_new, uy_new, uz_new, NEW, y2d_new, z2d_new)
+        final_div_rms = div_rms
+        final_div_max = div_max
+        print('      divergence check: rms = {:.6e}, max|div(u)| = {:.6e}'.format(
+            div_rms, div_max))
+    else:
+        j_mid = slice(BFR + 1, BFR + NEW.NY - 1)
+        k_mid = slice(BFR + 1, BFR + NEW.NZ - 1)
+        i_mid = slice(BFR + 1, BFR + NEW.NX - 1)
+        dudx = (ux_new[j_mid, k_mid, BFR + 2:BFR + NEW.NX]
+                - ux_new[j_mid, k_mid, BFR:BFR + NEW.NX - 2]) / (2.0 * dx_new)
+        dy = (y2d_new[BFR + 2:BFR + NEW.NY, k_mid]
+              - y2d_new[BFR:BFR + NEW.NY - 2, k_mid])[:, :, np.newaxis]
+        dudy = ((uy_new[BFR + 2:BFR + NEW.NY, k_mid, i_mid]
+                 - uy_new[BFR:BFR + NEW.NY - 2, k_mid, i_mid]) / dy)
+        dz = (z2d_new[j_mid, BFR + 2:BFR + NEW.NZ]
+              - z2d_new[j_mid, BFR:BFR + NEW.NZ - 2])[:, :, np.newaxis]
+        dwdz = ((uz_new[j_mid, BFR + 2:BFR + NEW.NZ, i_mid]
+                 - uz_new[j_mid, BFR:BFR + NEW.NZ - 2, i_mid]) / dz)
+        div_max = float(np.max(np.abs(dudx + dudy + dwdz)))
+        final_div_max = div_max
+        print('      divergence check (finite-difference fallback): max|div(u)| = {:.6e}'.format(
+            div_max))
+
     # ---- Step 7: f_eq + per-rank write ----
     print('[7/8] Reconstructing f_eq and writing per-rank files')
     parent_dir = os.path.dirname(writing_dir)
@@ -2656,8 +2768,10 @@ def main():
         rho_pr[r].tofile(os.path.join(writing_dir, 'rho_{}.bin'.format(r)))
     print('      wrote rho_0..rho_{}.bin'.format(NEW.JP - 1))
 
-    # f_neq reconstruction. Two modes:
-    #   chapman-enskog (default, fix for divergence): rebuild f_neq on NEW grid
+    # f_neq reconstruction. Three modes:
+    #   zero (current stability A/B test): write pure equilibrium f = f_eq
+    #     and therefore force f_neq = 0 on the rebuilt checkpoint.
+    #   chapman-enskog: rebuild f_neq on NEW grid
     #     from velocity gradients via CE expansion. Drops the OLD f_q files
     #     after rho/u extraction; gradients are evaluated on the NEW grid so
     #     they are self-consistent with NEW spacing.
@@ -2669,7 +2783,27 @@ def main():
     ce_omega_new = None
     ce_coeff_used = None
 
-    if args.fneq_mode == 'chapman-enskog':
+    if args.fneq_mode == 'zero':
+        print('      mode = zero: writing pure equilibrium f=f_eq (f_neq forced to 0)')
+        for q in range(19):
+            f_new = compute_feq_q(rho_new, ux_new, uy_new, uz_new, q)
+            enforce_periodic_physical_duplicates(f_new, NEW)
+            fill_ghost(f_new, NEW)
+
+            rho_check += f_new
+            if np.any(np.isnan(f_new)) or np.any(np.isinf(f_new)):
+                sys.exit('FATAL: f{:02d} contains NaN or Inf after equilibrium reconstruction'.format(q))
+            min_f = min(min_f, float(np.min(f_new)))
+            max_f = max(max_f, float(np.max(f_new)))
+
+            pr = split_y(f_new, NEW)
+            for r in range(NEW.JP):
+                pr[r].tofile(os.path.join(writing_dir, 'f{:02d}_{}.bin'.format(q, r)))
+            print('      wrote f{:02d}_0..f{:02d}_{} (equilibrium, f_neq=0)'.format(
+                q, q, NEW.JP - 1), flush=True)
+            del f_new, pr
+        print('      max |f_neq / f_eq|  = 0.000e+00   (forced equilibrium test)')
+    elif args.fneq_mode == 'chapman-enskog':
         # Resolve viscosity (variables.h: niu = Uref / Re).
         niu = args.niu
         if niu is None:
@@ -2881,9 +3015,35 @@ def main():
         'interp_Ub_old': '{:.15e}'.format(Ub_old),
         'interp_Ub_new_before': '{:.15e}'.format(Ub_new_before),
         'interp_Ub_new_after': '{:.15e}'.format(Ub_new_after),
+        'interp_Ub_final_before_feq': '{:.15e}'.format(Ub_final),
         'interp_Ub_scale': '{:.15e}'.format(ub_scale),
         'interp_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'interp_project_velocity': args.project_velocity,
+        'interp_projection_max_outer': str(args.projection_max_outer),
+        'interp_projection_div_tol': '{:.6e}'.format(args.projection_div_tol),
     }
+    if final_div_rms is not None:
+        new_meta['interp_final_div_rms'] = '{:.6e}'.format(final_div_rms)
+    if final_div_max is not None:
+        new_meta['interp_final_div_max'] = '{:.6e}'.format(final_div_max)
+    if proj_info is not None:
+        new_meta['interp_proj_div_rms_before'] = '{:.6e}'.format(proj_info['div_rms_before'])
+        new_meta['interp_proj_div_max_before'] = '{:.6e}'.format(proj_info['div_max_before'])
+        new_meta['interp_proj_div_rms_after'] = '{:.6e}'.format(proj_info['div_rms_after'])
+        new_meta['interp_proj_div_max_after'] = '{:.6e}'.format(proj_info['div_max_after'])
+        new_meta['interp_proj_div_rms_interior'] = '{:.6e}'.format(proj_info['div_rms_interior'])
+        new_meta['interp_proj_outer_iters'] = str(proj_info['outer_iters'])
+        new_meta['interp_proj_solve_time_s'] = '{:.1f}'.format(proj_info['solve_time_s'])
+        if 'method' in proj_info:
+            new_meta['interp_proj_method'] = str(proj_info['method'])
+        if 'rhs_mean' in proj_info:
+            new_meta['interp_proj_rhs_mean'] = '{:.6e}'.format(proj_info['rhs_mean'])
+        if 'true_residual_rms' in proj_info:
+            new_meta['interp_proj_true_residual_rms'] = '{:.6e}'.format(
+                proj_info['true_residual_rms'])
+        if 'true_residual_max' in proj_info:
+            new_meta['interp_proj_true_residual_max'] = '{:.6e}'.format(
+                proj_info['true_residual_max'])
     if ce_omega_new is not None:
         new_meta['interp_ce_omega_global_new'] = '{:.15e}'.format(ce_omega_new)
         new_meta['interp_ce_coeff'] = '{:.15e}'.format(ce_coeff_used)
